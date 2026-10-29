@@ -20,6 +20,8 @@ internals.state.tools.set("t1", {
 	toolCallId: "t1",
 	name: "bash",
 	brief: "cd /repo && docker buildx build --push -t registry.example/sandbox:latest .",
+	argsText: '{"command":"cd /repo && docker buildx build --push -t registry.example/sandbox:latest ."}',
+	lastOutput: "#21 [linux/arm64 4/5] RUN pnpm build  (1m22s)",
 	startedAt: Date.now() - 577_000,
 });
 internals.state.recent = [
@@ -43,7 +45,7 @@ const panel = new internals.ProgressPanel(
 	stubTui as never,
 	theme as never,
 	{
-		question: "现在进行到哪一步？卡在哪里？离完成还差什么？",
+		question: "现在在做什么？为什么要执行正在跑的那条命令？卡在哪里？离完成还差什么？",
 		status: "done",
 		answer:
 			"正在构建并推送沙箱镜像，docker buildx 已经跑了 9 分 37 秒，没有新的输出。这一步通常需要 10 分钟以上，目前不能中断。之后是更新模板指针。",

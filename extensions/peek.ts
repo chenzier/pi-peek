@@ -20,20 +20,22 @@ const SYSTEM_PROMPT = [
 	"输入的第一段是这个会话的完整上下文（可能很长），最后一段是当前的运行事实，以运行事实为准。",
 	"只使用给定的内容。不要猜测，不要编造数字、文件名或结论。",
 	"如果事实显示某个工具已经运行很久，就直接说这一点，不要粉饰成“正在推进”。",
+	"如果有一段调用尚未返回，解释它为什么被执行、目前停在哪一步，不要重复调用它。",
 	"不要承诺任何操作，不要道歉，不要输出标题或列表。",
 	"用 2 到 4 句简体中文直接回答。",
 ].join(" ");
 
-const DEFAULT_QUESTION = "现在进行到哪一步？卡在哪里？离完成还差什么？";
-const IDLE_QUESTION = "上一次运行停在哪一步？还有什么没有做完？";
+const DEFAULT_QUESTION =
+	"现在在做什么？为什么要执行正在跑的那条命令？卡在哪里？离完成还差什么？";
+const IDLE_QUESTION = "上一次运行做了什么？停在哪一步？还有什么没有做完？";
 const RECENT_TOOLS_KEPT = 6;
 /** Tool-call arguments are part of "what is this tool for", so full mode keeps them. */
 const TOOL_CALL_ARG_CHARS = 240;
 /**
- * Measured on a code-heavy Chinese transcript: 709 messages, 354k chars -> 320k tokens,
- * i.e. about 1.1 chars per token. Used only to size the budget.
+ * Measured on a real transcript: 709 messages, 889k chars -> 319,953 input tokens,
+ * i.e. about 2.8 chars per token. Used only to size the budget.
  */
-const CHARS_PER_TOKEN = 1.1;
+const CHARS_PER_TOKEN = 2.8;
 /** Share of the model window the conversation may take; the rest is facts, question and answer. */
 const CONTEXT_WINDOW_SHARE = 0.55;
 /** This tail is never truncated, whatever the budget says. */
@@ -45,11 +47,19 @@ const PROTECTED_RECENT_MESSAGES = 40;
 const APPENDED_MESSAGE_TIMESTAMP = 1_700_000_000_000;
 /** Per-message caps tried in order when the transcript exceeds the budget (old messages only). */
 const OLD_MESSAGE_CAPS = [8000, 4000, 2000, 900, 400, 200] as const;
+/** Full arguments of a running call, so "why did you run this" has an answer. */
+const RUNNING_ARGS_CHARS = 2000;
+/** Tail of a running tool's streaming output. */
+const RUNNING_OUTPUT_CHARS = 800;
 
 interface ToolRun {
 	toolCallId: string;
 	name: string;
 	brief: string;
+	/** Full arguments, kept because the model is asked why this call was made. */
+	argsText: string;
+	/** Tail of the streaming output, so a stuck build shows where it stopped. */
+	lastOutput: string;
 	startedAt: number;
 }
 
@@ -211,11 +221,13 @@ function factsForModel(facts: Facts): string {
 	];
 	if (facts.runningTools.length > 0) {
 		const now = Date.now();
-		lines.push(
-			`正在执行的工具: ${facts.runningTools
-				.map((tool) => `${tool.name}（已运行 ${formatMs(now - tool.startedAt)}）参数 ${tool.brief}`)
-				.join(" ; ")}`,
-		);
+		lines.push("", "【正在执行、尚未返回的调用】");
+		for (const tool of facts.runningTools) {
+			lines.push(`- ${tool.name}，已运行 ${formatMs(now - tool.startedAt)}`);
+			lines.push(`  参数: ${tool.argsText || tool.brief}`);
+			lines.push(`  最后输出: ${tool.lastOutput || "（还没有任何输出，或该工具不产出流式输出）"}`);
+		}
+		lines.push("这一轮的这个调用还没有结果，不要重复调用；请直接说明它为什么被执行、以及现在卡在哪。");
 	}
 	if (facts.recentTools.length > 0) {
 		lines.push(
@@ -269,6 +281,26 @@ function contextBudgetChars(ctx: ExtensionCommandContext): number {
  * provider, so a request with the same bytes reuses its cached prefix. Flattening the
  * transcript into one user message destroys that prefix and pays full price every time.
  */
+/**
+ * The only new content in the peek request: role instructions, the live facts (including calls
+ * that are still running, with their full arguments), and the user's question.
+ */
+function buildAppendedMessage(ctx: ExtensionCommandContext, question: string) {
+	return {
+		role: "user" as const,
+		content: [
+			SYSTEM_PROMPT,
+			"",
+			"【当前运行事实】",
+			factsForModel(buildFacts(ctx)),
+			"",
+			"【用户的问题】",
+			question,
+		].join("\n"),
+		timestamp: APPENDED_MESSAGE_TIMESTAMP,
+	};
+}
+
 function buildPayload(ctx: ExtensionCommandContext): Payload {
 	let messages: unknown[];
 	try {
@@ -452,8 +484,20 @@ export default function progressExtension(pi: ExtensionAPI) {
 			toolCallId: event.toolCallId,
 			name: event.toolName,
 			brief: briefArgs(event.args),
+			argsText: squash(JSON.stringify(event.args ?? {}), RUNNING_ARGS_CHARS),
+			lastOutput: "",
 			startedAt: Date.now(),
 		});
+	});
+
+	// The model is asked why a call was made and where it is stuck, so keep the output tail.
+	pi.on("tool_execution_update", (event) => {
+		const running = state.tools.get(event.toolCallId);
+		if (!running) return;
+		const text = messageText({ content: event.partialResult?.content ?? event.partialResult }) || String(event.partialResult ?? "");
+		if (!text) return;
+		const flat = text.replace(/\s+/g, " ").trim();
+		if (flat) running.lastOutput = flat.slice(-RUNNING_OUTPUT_CHARS);
 	});
 
 	pi.on("tool_execution_end", (event) => {
@@ -495,19 +539,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 
 		// Same system prompt, same messages, same tools as the main agent: only the tail below is
 		// new, so the provider can reuse the cached prefix instead of re-billing the whole branch.
-		const appended = {
-			role: "user" as const,
-			content: [
-				SYSTEM_PROMPT,
-				"",
-				"【当前运行事实】",
-				factsForModel(buildFacts(ctx)),
-				"",
-				"【用户的问题】",
-				slice.question,
-			].join("\n"),
-			timestamp: APPENDED_MESSAGE_TIMESTAMP,
-		};
+		const appended = buildAppendedMessage(ctx, slice.question);
 		const tools = activeToolDefinitions(pi);
 		const request = (withTools: boolean) => ({
 			systemPrompt: ctx.getSystemPrompt(),
@@ -612,6 +644,8 @@ export const internals = {
 	formatTokens,
 	squash,
 	buildPayload,
+	buildAppendedMessage,
+	factsForModel,
 	activeToolDefinitions,
 	contextBudgetChars,
 	state,
