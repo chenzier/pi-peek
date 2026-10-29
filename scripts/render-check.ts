@@ -50,6 +50,7 @@ const panel = new internals.ProgressPanel(
 		error: "",
 		startedAt: Date.now(),
 		abort: null,
+		contextNote: "全量 128 条 / 41k 字符",
 	},
 	facts,
 	{ onAbort() {}, onRefresh() {}, onClose() {} },

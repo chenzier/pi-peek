@@ -5,7 +5,7 @@
  * 这个命令在运行中立刻执行（扩展命令不排队），弹一个只读面板：
  *
  *   1. 确定性事实：轮次、运行时长、在跑的工具及其已耗时、排队消息、上下文占用
- *   2. 一次独立的小请求：这些动作合起来在干什么、卡在哪
+ *   2. 一次独立的小请求：拿到本会话的完整分支上下文，回答这些动作合起来在干什么、卡在哪
  *
  * 面板内容不写入主会话，不进入模型上下文。摘要请求是独立请求，不碰主 transcript。
  */
@@ -17,7 +17,8 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 
 const SYSTEM_PROMPT = [
 	"你是主 agent 的旁路观察者。用户正在等待一个长任务，想知道真实的进度。",
-	"只使用给定的事实与最近记录。不要猜测，不要编造数字、文件名或结论。",
+	"输入的第一段是这个会话的完整上下文（可能很长），最后一段是当前的运行事实，以运行事实为准。",
+	"只使用给定的内容。不要猜测，不要编造数字、文件名或结论。",
 	"如果事实显示某个工具已经运行很久，就直接说这一点，不要粉饰成“正在推进”。",
 	"不要承诺任何操作，不要道歉，不要输出标题或列表。",
 	"用 2 到 4 句简体中文直接回答。",
@@ -26,8 +27,16 @@ const SYSTEM_PROMPT = [
 const DEFAULT_QUESTION = "现在进行到哪一步？卡在哪里？离完成还差什么？";
 const IDLE_QUESTION = "上一次运行停在哪一步？还有什么没有做完？";
 const RECENT_TOOLS_KEPT = 6;
-const DIGEST_MESSAGES = 8;
-const DIGEST_CHARS_PER_MESSAGE = 280;
+/** Per-message cap in full-context mode; keeps one huge tool dump from eating the budget. */
+const FULL_CHARS_PER_MESSAGE = 1200;
+/** Tool-call arguments are part of "what is this tool for", so full mode keeps them. */
+const TOOL_CALL_ARG_CHARS = 240;
+/** Rough chars-per-token for mixed Chinese/code text; only used to size the budget. */
+const CHARS_PER_TOKEN = 2.2;
+/** Share of the model window the conversation may take; the rest is facts, question and answer. */
+const CONTEXT_WINDOW_SHARE = 0.55;
+/** Messages kept verbatim when the full transcript is too large. */
+const FALLBACK_MESSAGES = 60;
 
 interface ToolRun {
 	toolCallId: string;
@@ -60,6 +69,8 @@ interface PanelState {
 	error: string;
 	startedAt: number;
 	abort: AbortController | null;
+	/** How much conversation went into the summary request, e.g. "全量 128 条 / 41k 字符". */
+	contextNote: string;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -100,16 +111,20 @@ function briefArgs(args: unknown): string {
 	return squash(JSON.stringify(record), 90);
 }
 
-function messageText(message: unknown): string {
+function messageText(message: unknown, toolCallArgChars = 0): string {
 	const content = (message as { content?: unknown } | null)?.content;
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
 	for (const block of content) {
 		if (!block || typeof block !== "object") continue;
-		const typed = block as { type?: string; text?: string; name?: string; thinking?: string };
+		const typed = block as { type?: string; text?: string; name?: string; arguments?: unknown };
 		if (typed.type === "text" && typeof typed.text === "string") parts.push(typed.text);
-		else if (typed.type === "toolCall" && typeof typed.name === "string") parts.push(`[调用 ${typed.name}]`);
+		else if (typed.type === "toolCall" && typeof typed.name === "string") {
+			// Arguments are what tell the model *what* the tool is doing, so full-context mode keeps them.
+			const args = toolCallArgChars > 0 ? briefArgs(typed.arguments) : "";
+			parts.push(args ? `[调用 ${typed.name} ${squash(args, toolCallArgChars)}]` : `[调用 ${typed.name}]`);
+		}
 	}
 	return parts.join(" ");
 }
@@ -199,26 +214,79 @@ function factsForModel(facts: Facts): string {
 	return lines.join("\n");
 }
 
-function buildDigest(ctx: ExtensionCommandContext): string {
+interface Conversation {
+	text: string;
+	/** Short human label for the panel, e.g. "全量 128 条 / 41k 字符". */
+	note: string;
+	chars: number;
+	count: number;
+	mode: "full" | "trimmed";
+}
+
+function renderMessages(messages: unknown[]): string[] {
+	return messages
+		.map((message) => {
+			const record = message as { role?: string; toolName?: string; isError?: boolean };
+			const text = messageText(message, TOOL_CALL_ARG_CHARS);
+			if (!text) return "";
+			const label =
+				record.role === "assistant"
+					? "agent"
+					: record.role === "toolResult"
+						? `工具:${record.toolName ?? "?"}${record.isError ? "(失败)" : ""}`
+						: "用户";
+			return `- ${label}: ${squash(text, FULL_CHARS_PER_MESSAGE)}`;
+		})
+		.filter((line) => line.length > 0);
+}
+
+/**
+ * The side request gets the whole active branch by default: a running tool means nothing
+ * without the task it belongs to. Cost stays bounded by per-message caps, by falling back
+ * above MAX_CONTEXT_CHARS, and by ordering the stable history first so repeated peeks in
+ * one run reuse the prompt cache.
+ */
+function contextBudgetChars(ctx: ExtensionCommandContext): number {
+	const window = ctx.model?.contextWindow ?? 200_000;
+	return Math.max(60_000, Math.floor(window * CONTEXT_WINDOW_SHARE * CHARS_PER_TOKEN));
+}
+
+function buildConversation(ctx: ExtensionCommandContext): Conversation {
 	let messages: unknown[];
 	try {
-		const entries = ctx.sessionManager.getEntries();
-		const leafId = ctx.sessionManager.getLeafId();
-		const built = buildSessionContext(entries, leafId);
+		const built = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
 		messages = convertToLlm(built.messages) as unknown[];
 	} catch {
-		return "";
+		return { text: "", note: "会话读取失败", chars: 0, count: 0, mode: "trimmed" };
 	}
-	const lines: string[] = [];
-	for (const message of messages.slice(-DIGEST_MESSAGES)) {
-		const record = message as { role?: string; toolName?: string };
-		const text = messageText(message);
-		if (!text) continue;
-		const label =
-			record.role === "assistant" ? "agent" : record.role === "toolResult" ? `工具:${record.toolName ?? "?"}` : "用户";
-		lines.push(`- ${label}: ${squash(text, DIGEST_CHARS_PER_MESSAGE)}`);
+
+	const budget = contextBudgetChars(ctx);
+	const lines = renderMessages(messages);
+	const text = lines.join("\n");
+	if (text.length <= budget) {
+		return {
+			text,
+			note: `全量 ${messages.length} 条 / ${formatTokens(text.length)} 字符`,
+			chars: text.length,
+			count: messages.length,
+			mode: "full",
+		};
 	}
-	return lines.join("\n");
+
+	// Too large: keep the opening (original task, or the compaction summary that replaced it)
+	// plus verbatim recent history. Nothing invents content the transcript does not have.
+	const head = messages.slice(0, 2);
+	const tail = messages.slice(-FALLBACK_MESSAGES);
+	const kept = head.concat(tail.filter((message) => !head.includes(message)));
+	const keptLines = renderMessages(kept);
+	const keptText = keptLines.join("\n");
+	return {
+		text: keptText,
+		note: `节选 ${kept.length}/${messages.length} 条 / ${formatTokens(keptText.length)} 字符（超出窗口）`,
+		chars: keptText.length,
+		count: kept.length,
+		mode: "trimmed",
+	};
 }
 
 // ----------------------------------------------------------------- UI panel
@@ -301,14 +369,15 @@ class ProgressPanel implements Component {
 
 		body.push("");
 		const elapsed = this.slice.status === "asking" ? formatMs(Date.now() - this.slice.startedAt) : undefined;
+		const scope = this.slice.contextNote ? ` · ${this.slice.contextNote}` : "";
 		const label =
 			this.slice.status === "asking"
-				? `摘要 · 生成中 ${elapsed ?? ""}`
+				? `摘要${scope} · 生成中 ${elapsed ?? ""}`
 				: this.slice.status === "done"
-					? "摘要"
+					? `摘要${scope}`
 					: this.slice.status === "aborted"
-						? "摘要 · 已中止"
-						: "摘要 · 失败";
+						? `摘要 · 已中止`
+						: `摘要 · 失败`;
 		body.push(` ${th.fg("muted", truncateToWidth(label, contentWidth))}`);
 		if (this.slice.answer) {
 			for (const line of wrapText(this.slice.answer, contentWidth, 12)) {
@@ -409,12 +478,15 @@ export default function progressExtension(pi: ExtensionAPI) {
 		slice.error = "";
 		render();
 
+		const conversation = buildConversation(ctx);
+		slice.contextNote = conversation.note;
 		const prompt = [
-			"【运行事实】",
-			factsForModel(buildFacts(ctx)),
+			// Stable history first: repeated peeks inside one run reuse the cached prefix.
+			`【会话上下文（${conversation.note}）】`,
+			conversation.text || "(无记录)",
 			"",
-			"【最近记录（按时间顺序，已压缩）】",
-			buildDigest(ctx) || "(无记录)",
+			"【当前运行事实】",
+			factsForModel(buildFacts(ctx)),
 			"",
 			"【用户的问题】",
 			slice.question,
@@ -424,7 +496,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 			const answer = await ctx.modelRegistry.complete(
 				model,
 				{ systemPrompt: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-				{ maxTokens: 500, cacheRetention: "none", signal: abort.signal },
+				{ maxTokens: 600, cacheRetention: "short", signal: abort.signal },
 			);
 			slice.answer = messageText(answer).trim() || "(模型没有返回内容)";
 			slice.status = "done";
@@ -463,6 +535,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 				error: "",
 				startedAt: Date.now(),
 				abort: null,
+				contextNote: "",
 			};
 
 			await ctx.ui.custom<void>(
@@ -499,4 +572,4 @@ export default function progressExtension(pi: ExtensionAPI) {
 	});
 }
 
-export const internals = { ProgressPanel, wrapText, formatMs, formatTokens, squash, state };
+export const internals = { ProgressPanel, wrapText, formatMs, formatTokens, squash, buildConversation, contextBudgetChars, state };
