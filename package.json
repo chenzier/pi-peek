@@ -1,0 +1,46 @@
+{
+	"name": "@chenzier/pi-peek",
+	"version": "0.1.0",
+	"description": "pi extension: peek at the main agent's live progress in a read-only overlay without touching the conversation context",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"progress",
+		"overlay"
+	],
+	"files": [
+		"extensions/**/*.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/peek.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"render-check": "node --experimental-strip-types scripts/render-check.ts"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@earendil-works/pi-tui": "^1.1.0",
+		"@types/node": "^22.0.0",
+		"typescript": "^5.8.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chenzier/pi-peek.git"
+	},
+	"bugs": {
+		"url": "https://github.com/chenzier/pi-peek/issues"
+	},
+	"homepage": "https://github.com/chenzier/pi-peek#readme"
+}
