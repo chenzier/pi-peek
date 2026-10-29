@@ -76,6 +76,12 @@ function formatMs(ms: number): string {
 	return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
+function formatTokens(tokens: number): string {
+	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+	if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`;
+	return String(tokens);
+}
+
 function squash(text: string, max = 300): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	if (flat.length <= max) return flat;
@@ -150,8 +156,8 @@ function buildFacts(ctx: ExtensionCommandContext): Facts {
 	const usage = ctx.getContextUsage();
 	const contextText = usage
 		? usage.percent === null
-			? `?/${Math.round(usage.contextWindow / 1000)}k`
-			: `${usage.percent}%/${Math.round(usage.contextWindow / 1000)}k`
+			? `?/${formatTokens(usage.contextWindow)}`
+			: `${Math.round(usage.percent)}%/${formatTokens(usage.contextWindow)}`
 		: "?";
 	const now = Date.now();
 	return {
@@ -493,4 +499,4 @@ export default function progressExtension(pi: ExtensionAPI) {
 	});
 }
 
-export const internals = { ProgressPanel, wrapText, formatMs, squash, state };
+export const internals = { ProgressPanel, wrapText, formatMs, formatTokens, squash, state };

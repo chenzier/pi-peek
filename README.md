@@ -6,7 +6,7 @@
 /peek
 ```
 
-![面板](docs/panel.txt)
+![真实运行中的 /peek 面板](docs/screenshot.png)
 
 ## 为什么需要它
 
@@ -76,7 +76,7 @@ pi --extension /path/to/pi-peek/extensions/peek.ts
 ```bash
 pnpm install
 pnpm typecheck      # tsc --strict
-pnpm render-check   # 用合成状态打印面板，不需要 TUI
+pnpm render-check   # 用合成状态打印面板，不需要 TUI（输出见 docs/panel.txt）
 ```
 
 在 pi 1.1.0 上开发与验证；类型检查同时对 `@earendil-works/pi-coding-agent@1.4.0` 通过。
