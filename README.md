@@ -6,7 +6,9 @@
 /peek
 ```
 
-![真实运行中的 /peek 面板](docs/screenshot.png)
+面板浮在正在运行的会话上方：下面那半屏是主 agent 的实时输出，主输入框和正在跑的任务都不受影响。
+
+![真实终端里的 /peek 面板](docs/screenshot.png)
 
 ## 为什么需要它
 
