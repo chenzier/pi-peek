@@ -27,16 +27,24 @@ const SYSTEM_PROMPT = [
 const DEFAULT_QUESTION = "现在进行到哪一步？卡在哪里？离完成还差什么？";
 const IDLE_QUESTION = "上一次运行停在哪一步？还有什么没有做完？";
 const RECENT_TOOLS_KEPT = 6;
-/** Per-message cap in full-context mode; keeps one huge tool dump from eating the budget. */
-const FULL_CHARS_PER_MESSAGE = 1200;
 /** Tool-call arguments are part of "what is this tool for", so full mode keeps them. */
 const TOOL_CALL_ARG_CHARS = 240;
-/** Rough chars-per-token for mixed Chinese/code text; only used to size the budget. */
-const CHARS_PER_TOKEN = 2.2;
+/**
+ * Measured on a code-heavy Chinese transcript: 709 messages, 354k chars -> 320k tokens,
+ * i.e. about 1.1 chars per token. Used only to size the budget.
+ */
+const CHARS_PER_TOKEN = 1.1;
 /** Share of the model window the conversation may take; the rest is facts, question and answer. */
 const CONTEXT_WINDOW_SHARE = 0.55;
-/** Messages kept verbatim when the full transcript is too large. */
-const FALLBACK_MESSAGES = 60;
+/** This tail is never truncated, whatever the budget says. */
+const PROTECTED_RECENT_MESSAGES = 40;
+/**
+ * Timestamp stamped on the appended question. A stable value keeps the request bytes steady so
+ * the provider's prefix cache stays usable; pi never uses the value semantically.
+ */
+const APPENDED_MESSAGE_TIMESTAMP = 1_700_000_000_000;
+/** Per-message caps tried in order when the transcript exceeds the budget (old messages only). */
+const OLD_MESSAGE_CAPS = [8000, 4000, 2000, 900, 400, 200] as const;
 
 interface ToolRun {
 	toolCallId: string;
@@ -129,6 +137,11 @@ function messageText(message: unknown, toolCallArgChars = 0): string {
 	return parts.join(" ");
 }
 
+function hasToolCall(message: unknown): boolean {
+	const content = (message as { content?: unknown } | null)?.content;
+	return Array.isArray(content) && content.some((block) => (block as { type?: string } | null)?.type === "toolCall");
+}
+
 function wrapText(text: string, width: number, maxLines: number): string[] {
 	const limit = Math.max(1, width);
 	const lines: string[] = [];
@@ -214,79 +227,78 @@ function factsForModel(facts: Facts): string {
 	return lines.join("\n");
 }
 
-interface Conversation {
-	text: string;
-	/** Short human label for the panel, e.g. "全量 128 条 / 41k 字符". */
+interface Payload {
+	/** Real transcript messages, exactly as the agent would send them. */
+	messages: unknown[];
+	/** Short human label for the panel. */
 	note: string;
-	chars: number;
-	count: number;
-	mode: "full" | "trimmed";
-}
-
-function renderMessages(messages: unknown[]): string[] {
-	return messages
-		.map((message) => {
-			const record = message as { role?: string; toolName?: string; isError?: boolean };
-			const text = messageText(message, TOOL_CALL_ARG_CHARS);
-			if (!text) return "";
-			const label =
-				record.role === "assistant"
-					? "agent"
-					: record.role === "toolResult"
-						? `工具:${record.toolName ?? "?"}${record.isError ? "(失败)" : ""}`
-						: "用户";
-			return `- ${label}: ${squash(text, FULL_CHARS_PER_MESSAGE)}`;
-		})
-		.filter((line) => line.length > 0);
 }
 
 /**
- * The side request gets the whole active branch by default: a running tool means nothing
- * without the task it belongs to. Cost stays bounded by per-message caps, by falling back
- * above MAX_CONTEXT_CHARS, and by ordering the stable history first so repeated peeks in
- * one run reuse the prompt cache.
+ * Rough text size of a message list. JSON.stringify would overstate it several times over
+ * (ids, metadata, block wrappers), which made a 1M-window session look like it did not fit.
  */
+function estimateChars(messages: unknown[]): number {
+	let total = 0;
+	for (const message of messages) {
+		const content = (message as { content?: unknown } | null)?.content;
+		if (typeof content === "string") {
+			total += content.length;
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (!block || typeof block !== "object") continue;
+			const typed = block as { type?: string; text?: string; arguments?: unknown };
+			if (typed.type === "text" && typeof typed.text === "string") total += typed.text.length;
+			else if (typed.type === "toolCall") total += JSON.stringify(typed.arguments ?? {}).length;
+		}
+	}
+	return total;
+}
+
 function contextBudgetChars(ctx: ExtensionCommandContext): number {
 	const window = ctx.model?.contextWindow ?? 200_000;
 	return Math.max(60_000, Math.floor(window * CONTEXT_WINDOW_SHARE * CHARS_PER_TOKEN));
 }
 
-function buildConversation(ctx: ExtensionCommandContext): Conversation {
+/**
+ * Replay the active branch as real messages instead of a flattened text digest.
+ *
+ * This is the whole point: the main agent already sent `tools + system + messages` to the
+ * provider, so a request with the same bytes reuses its cached prefix. Flattening the
+ * transcript into one user message destroys that prefix and pays full price every time.
+ */
+function buildPayload(ctx: ExtensionCommandContext): Payload {
 	let messages: unknown[];
 	try {
 		const built = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
 		messages = convertToLlm(built.messages) as unknown[];
 	} catch {
-		return { text: "", note: "会话读取失败", chars: 0, count: 0, mode: "trimmed" };
+		return { messages: [], note: "会话读取失败" };
 	}
 
 	const budget = contextBudgetChars(ctx);
-	const lines = renderMessages(messages);
-	const text = lines.join("\n");
-	if (text.length <= budget) {
-		return {
-			text,
-			note: `全量 ${messages.length} 条 / ${formatTokens(text.length)} 字符`,
-			chars: text.length,
-			count: messages.length,
-			mode: "full",
-		};
+	const size = estimateChars(messages);
+	if (size <= budget) {
+		return { messages, note: `全量 ${messages.length} 条` };
 	}
 
-	// Too large: keep the opening (original task, or the compaction summary that replaced it)
-	// plus verbatim recent history. Nothing invents content the transcript does not have.
+	// Over budget: keep the opening (original task or the compaction summary that replaced it)
+	// plus the recent tail. This breaks the cache prefix, so the panel says so.
 	const head = messages.slice(0, 2);
-	const tail = messages.slice(-FALLBACK_MESSAGES);
+	const tail = messages.slice(-PROTECTED_RECENT_MESSAGES);
 	const kept = head.concat(tail.filter((message) => !head.includes(message)));
-	const keptLines = renderMessages(kept);
-	const keptText = keptLines.join("\n");
-	return {
-		text: keptText,
-		note: `节选 ${kept.length}/${messages.length} 条 / ${formatTokens(keptText.length)} 字符（超出窗口）`,
-		chars: keptText.length,
-		count: kept.length,
-		mode: "trimmed",
-	};
+	return { messages: kept, note: `节选 ${kept.length}/${messages.length} 条（超窗口 ${formatTokens(size)} 字符）` };
+}
+
+/** The tool definitions the main agent declares, so the cached prefix matches. */
+function activeToolDefinitions(pi: ExtensionAPI): unknown[] {
+	const active = new Set(pi.getActiveTools());
+	return pi
+		.getAllTools()
+		.filter((tool) => active.has(tool.name))
+		.map(({ name, description, parameters }) => ({ name, description, parameters }));
 }
 
 // ----------------------------------------------------------------- UI panel
@@ -478,26 +490,47 @@ export default function progressExtension(pi: ExtensionAPI) {
 		slice.error = "";
 		render();
 
-		const conversation = buildConversation(ctx);
-		slice.contextNote = conversation.note;
-		const prompt = [
-			// Stable history first: repeated peeks inside one run reuse the cached prefix.
-			`【会话上下文（${conversation.note}）】`,
-			conversation.text || "(无记录)",
-			"",
-			"【当前运行事实】",
-			factsForModel(buildFacts(ctx)),
-			"",
-			"【用户的问题】",
-			slice.question,
-		].join("\n");
+		const payload = buildPayload(ctx);
+		slice.contextNote = payload.note;
+
+		// Same system prompt, same messages, same tools as the main agent: only the tail below is
+		// new, so the provider can reuse the cached prefix instead of re-billing the whole branch.
+		const appended = {
+			role: "user" as const,
+			content: [
+				SYSTEM_PROMPT,
+				"",
+				"【当前运行事实】",
+				factsForModel(buildFacts(ctx)),
+				"",
+				"【用户的问题】",
+				slice.question,
+			].join("\n"),
+			timestamp: APPENDED_MESSAGE_TIMESTAMP,
+		};
+		const tools = activeToolDefinitions(pi);
+		const request = (withTools: boolean) => ({
+			systemPrompt: ctx.getSystemPrompt(),
+			messages: [...payload.messages, appended] as never,
+			...(withTools && tools.length > 0 ? { tools: tools as never } : {}),
+		});
 
 		try {
-			const answer = await ctx.modelRegistry.complete(
-				model,
-				{ systemPrompt: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-				{ maxTokens: 600, cacheRetention: "short", signal: abort.signal },
-			);
+			let answer = await ctx.modelRegistry.complete(model, request(true), {
+				maxTokens: 600,
+				cacheRetention: "short",
+				// Keep the cached prefix but forbid the model from actually running anything.
+				toolChoice: "none",
+				signal: abort.signal,
+			});
+			if (!messageText(answer).trim() && hasToolCall(answer)) {
+				// A provider ignored toolChoice: drop the tools so it answers instead of acting.
+				answer = await ctx.modelRegistry.complete(model, request(false), {
+					maxTokens: 600,
+					cacheRetention: "short",
+					signal: abort.signal,
+				});
+			}
 			slice.answer = messageText(answer).trim() || "(模型没有返回内容)";
 			slice.status = "done";
 		} catch (error) {
@@ -572,4 +605,14 @@ export default function progressExtension(pi: ExtensionAPI) {
 	});
 }
 
-export const internals = { ProgressPanel, wrapText, formatMs, formatTokens, squash, buildConversation, contextBudgetChars, state };
+export const internals = {
+	ProgressPanel,
+	wrapText,
+	formatMs,
+	formatTokens,
+	squash,
+	buildPayload,
+	activeToolDefinitions,
+	contextBudgetChars,
+	state,
+};
