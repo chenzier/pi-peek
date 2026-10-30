@@ -13,7 +13,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { buildSessionContext, convertToLlm } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const SYSTEM_PROMPT = [
 	"你是主 agent 的旁路观察者。用户正在等待一个长任务，想知道真实的进度。",
@@ -51,6 +51,8 @@ const OLD_MESSAGE_CAPS = [8000, 4000, 2000, 900, 400, 200] as const;
 const RUNNING_ARGS_CHARS = 2000;
 /** Tail of a running tool's streaming output. */
 const RUNNING_OUTPUT_CHARS = 800;
+/** Answer lines visible at once; ↑/↓ scroll the rest. */
+const ANSWER_VISIBLE_LINES = 12;
 
 interface ToolRun {
 	toolCallId: string;
@@ -89,6 +91,8 @@ interface PanelState {
 	abort: AbortController | null;
 	/** How much conversation went into the summary request, e.g. "全量 128 条 / 41k 字符". */
 	contextNote: string;
+	/** Monotonic id so a slow earlier answer cannot overwrite a newer one. */
+	seq: number;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -342,24 +346,41 @@ class ProgressPanel implements Component {
 	private readonly getFacts: () => Facts;
 	private readonly slice: PanelState;
 	private readonly onAbort: () => void;
-	private readonly onRefresh: () => void;
+	private readonly onAsk: (question: string) => void;
 	private readonly onClose: () => void;
 	private readonly timer: ReturnType<typeof setInterval>;
+	/** Line-based follow-up input at the bottom of the panel. */
+	private readonly input: Input;
+	/** How many wrapped answer lines are scrolled up from the bottom. */
+	private scrollOffset = 0;
 
 	constructor(
 		tui: TUI,
 		theme: Theme,
 		slice: PanelState,
 		getFacts: () => Facts,
-		actions: { onAbort: () => void; onRefresh: () => void; onClose: () => void },
+		actions: { onAbort: () => void; onAsk: (question: string) => void; onClose: () => void },
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.slice = slice;
 		this.getFacts = getFacts;
 		this.onAbort = actions.onAbort;
-		this.onRefresh = actions.onRefresh;
+		this.onAsk = actions.onAsk;
 		this.onClose = actions.onClose;
+		this.input = new Input({ prompt: "> ", placeholder: "追问，或空着按 Enter 重新问一次" });
+		this.input.onSubmit = (value) => {
+			if (this.slice.status === "asking") return;
+			const question = value.trim();
+			this.scrollOffset = 0;
+			if (!question) {
+				// Empty submit re-asks the current question, replacing the old r shortcut.
+				this.onAsk(this.slice.question);
+				return;
+			}
+			this.input.setValue("");
+			this.onAsk(question);
+		};
 		// 面板里的秒表需要持续重绘；这个定时器只存在于此组件实例，关闭即清。
 		this.timer = setInterval(() => this.tui.requestRender(), 500);
 	}
@@ -372,11 +393,22 @@ class ProgressPanel implements Component {
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			// Abort while generating, close when idle — same dual state as /btw.
 			if (this.slice.abort) this.onAbort();
 			else this.onClose();
 			return;
 		}
-		if (matchesKey(data, "r")) this.onRefresh();
+		if (matchesKey(data, "up")) {
+			this.scrollOffset += 1;
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+			this.tui.requestRender();
+			return;
+		}
+		this.input.handleInput(data);
 	}
 
 	render(width: number): string[] {
@@ -424,7 +456,15 @@ class ProgressPanel implements Component {
 						: `摘要 · 失败`;
 		body.push(` ${th.fg("muted", truncateToWidth(label, contentWidth))}`);
 		if (this.slice.answer) {
-			for (const line of wrapText(this.slice.answer, contentWidth, 12)) {
+			const wrapped = wrapText(this.slice.answer, contentWidth, 10_000);
+			const maxOffset = Math.max(0, wrapped.length - ANSWER_VISIBLE_LINES);
+			this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
+			const start = Math.max(0, wrapped.length - ANSWER_VISIBLE_LINES - this.scrollOffset);
+			const visible = wrapped.slice(start, start + ANSWER_VISIBLE_LINES);
+			if (this.scrollOffset > 0) {
+				body.push(` ${th.fg("dim", `↑ 回看 ${this.scrollOffset} 行 · ↓ 回到底部`)}`);
+			}
+			for (const line of visible) {
 				body.push(` ${th.fg("text", line)}`);
 			}
 		} else if (this.slice.status === "asking") {
@@ -436,7 +476,26 @@ class ProgressPanel implements Component {
 		}
 
 		body.push("");
-		body.push(` ${th.fg("dim", truncateToWidth("Esc 关闭 · r 重新总结", contentWidth))}`);
+		// The embedded input must render unfocused, otherwise its cursor marker skews the row.
+		const wasFocused = this.input.focused;
+		this.input.focused = false;
+		let inputLine: string;
+		try {
+			// Strip the input's APC cursor markers: the box measures visible width, and a raw
+			// marker would shift the right border by its hidden length.
+			inputLine = truncateToWidth(this.input.render(contentWidth)[0] ?? "", contentWidth, "").replace(
+				/\u001b_[^\u0007]*\u0007/g,
+				"",
+			);
+		} finally {
+			this.input.focused = wasFocused;
+		}
+		body.push(` ${inputLine}${" ".repeat(Math.max(0, contentWidth - visibleWidth(inputLine)))}`);
+		const hint =
+			this.slice.status === "asking"
+				? "生成中… Esc 中止 · ↑↓ 滚动"
+				: "Enter 追问（空着提交=重新问一次） · Esc 关闭 · ↑↓ 滚动";
+		body.push(` ${th.fg("dim", truncateToWidth(hint, contentWidth))}`);
 
 		return this.box(body, width, `/peek · ${truncateToWidth(this.slice.question, Math.max(8, innerWidth - 18))}`);
 	}
@@ -527,6 +586,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const abort = new AbortController();
+		const seq = ++slice.seq;
 		slice.abort = abort;
 		slice.status = "asking";
 		slice.startedAt = Date.now();
@@ -563,9 +623,11 @@ export default function progressExtension(pi: ExtensionAPI) {
 					signal: abort.signal,
 				});
 			}
+			if (slice.seq !== seq) return;
 			slice.answer = messageText(answer).trim() || "(模型没有返回内容)";
 			slice.status = "done";
 		} catch (error) {
+			if (slice.seq !== seq) return;
 			if (abort.signal.aborted) {
 				slice.status = "aborted";
 			} else {
@@ -573,8 +635,8 @@ export default function progressExtension(pi: ExtensionAPI) {
 				slice.error = error instanceof Error ? error.message : String(error);
 			}
 		} finally {
-			slice.abort = null;
-			render();
+			if (slice.abort === abort) slice.abort = null;
+			if (slice.seq === seq) render();
 		}
 	}
 
@@ -601,6 +663,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 				startedAt: Date.now(),
 				abort: null,
 				contextNote: "",
+				seq: 0,
 			};
 
 			await ctx.ui.custom<void>(
@@ -614,8 +677,9 @@ export default function progressExtension(pi: ExtensionAPI) {
 							slice.abort?.abort();
 							render();
 						},
-						onRefresh: () => {
+						onAsk: (question) => {
 							slice.abort?.abort();
+							slice.question = question;
 							void ask(ctx, slice, render);
 						},
 						onClose: () => {

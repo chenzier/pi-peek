@@ -53,9 +53,10 @@ const panel = new internals.ProgressPanel(
 		startedAt: Date.now(),
 		abort: null,
 		contextNote: "全量 128 条 / 41k 字符",
+		seq: 0,
 	},
 	facts,
-	{ onAbort() {}, onRefresh() {}, onClose() {} },
+	{ onAbort() {}, onAsk() {}, onClose() {} },
 );
 
 for (const line of panel.render(78)) console.log(line);
