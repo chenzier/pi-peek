@@ -7,7 +7,11 @@
  *   pnpm render-check
  */
 
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { internals } from "../extensions/peek.ts";
+
+// The real TUI initializes the theme at startup; the offline check must do it too.
+initTheme("dark", false);
 
 const theme = { fg: (_color: string, text: string) => text };
 const stubTui = { requestRender() {} };
@@ -32,6 +36,7 @@ internals.state.recent = [
 ];
 
 const facts = () => ({
+	phase: "running" as const,
 	running: internals.state.running,
 	elapsedMs: Date.now() - internals.state.runStartedAt,
 	turns: internals.state.turnIndex,
@@ -47,12 +52,19 @@ const panel = new internals.ProgressPanel(
 	{
 		question: "现在在做什么？为什么要执行正在跑的那条命令？卡在哪里？离完成还差什么？",
 		status: "done",
-		answer:
-			"正在构建并推送沙箱镜像，docker buildx 已经跑了 9 分 37 秒，没有新的输出。这一步通常需要 10 分钟以上，目前不能中断。之后是更新模板指针。",
+		answer: [
+			"正在构建并推送沙箱镜像，`docker buildx` 已经跑了 **9 分 37 秒**，没有新的输出。",
+			"",
+			"- 停在 `linux/arm64` 的 `RUN pnpm build`",
+			"- 之后是更新 E2B 模板指针",
+			"",
+			"## 建议",
+			"再等 3 分钟；如果还没动静，`Esc` 中止后重跑。",
+		].join("\n"),
 		error: "",
 		startedAt: Date.now(),
 		abort: null,
-		contextNote: "全量 128 条 / 41k 字符",
+		contextNote: "全量 128 条",
 		seq: 0,
 	},
 	facts,

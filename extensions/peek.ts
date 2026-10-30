@@ -11,9 +11,9 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { buildSessionContext, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Input, Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const SYSTEM_PROMPT = [
 	"你是主 agent 的旁路观察者。用户正在等待一个长任务，想知道真实的进度。",
@@ -52,7 +52,9 @@ const RUNNING_ARGS_CHARS = 2000;
 /** Tail of a running tool's streaming output. */
 const RUNNING_OUTPUT_CHARS = 800;
 /** Answer lines visible at once; ↑/↓ scroll the rest. */
-const ANSWER_VISIBLE_LINES = 12;
+const ANSWER_VISIBLE_LINES = 10;
+/** Comfortable reading width; wide terminals should not stretch the answer to 160 columns. */
+const MAX_CONTENT_WIDTH = 92;
 
 interface ToolRun {
 	toolCallId: string;
@@ -185,6 +187,8 @@ function wrapText(text: string, width: number, maxLines: number): string[] {
 // ------------------------------------------------------------- facts + digest
 
 interface Facts {
+	/** "never" = 本次会话还没有可用的运行记录（扩展刚加载，或 agent 从未跑过）。 */
+	phase: "never" | "running" | "idle";
 	running: boolean;
 	elapsedMs: number;
 	turns: number;
@@ -202,7 +206,9 @@ function buildFacts(ctx: ExtensionCommandContext): Facts {
 			: `${Math.round(usage.percent)}%/${formatTokens(usage.contextWindow)}`
 		: "?";
 	const now = Date.now();
+	const phase: Facts["phase"] = state.running ? "running" : state.runStartedAt === 0 && state.turnsCompleted === 0 ? "never" : "idle";
 	return {
+		phase,
 		running: state.running,
 		elapsedMs: state.running ? now - state.runStartedAt : state.lastActivityAt ? now - state.lastActivityAt : 0,
 		turns: state.running ? state.turnIndex : state.turnsCompleted,
@@ -215,7 +221,9 @@ function buildFacts(ctx: ExtensionCommandContext): Facts {
 
 function factsForModel(facts: Facts): string {
 	const lines = [
-		`状态: ${facts.running ? "运行中" : "空闲"}`,
+		facts.phase === "never"
+			? "状态: 未记录（本次会话还没有运行记录；扩展可能刚加载）"
+			: `状态: ${facts.running ? "运行中" : "空闲"}`,
 		facts.running
 			? `本次运行已持续: ${formatMs(facts.elapsedMs)}`
 			: `距上次运行结束: ${formatMs(facts.elapsedMs)}`,
@@ -351,6 +359,9 @@ class ProgressPanel implements Component {
 	private readonly timer: ReturnType<typeof setInterval>;
 	/** Line-based follow-up input at the bottom of the panel. */
 	private readonly input: Input;
+	/** Renders the answer as markdown instead of raw ** and ## markers. */
+	private readonly markdown = new Markdown("", 0, 0, getMarkdownTheme());
+	private markdownText = "";
 	/** How many wrapped answer lines are scrolled up from the bottom. */
 	private scrollOffset = 0;
 
@@ -368,7 +379,7 @@ class ProgressPanel implements Component {
 		this.onAbort = actions.onAbort;
 		this.onAsk = actions.onAsk;
 		this.onClose = actions.onClose;
-		this.input = new Input({ prompt: "> ", placeholder: "追问，或空着按 Enter 重新问一次" });
+		this.input = new Input({ prompt: "> ", placeholder: "追问…" });
 		this.input.onSubmit = (value) => {
 			if (this.slice.status === "asking") return;
 			const question = value.trim();
@@ -415,18 +426,22 @@ class ProgressPanel implements Component {
 		const th = this.theme;
 		const facts = this.getFacts();
 		const innerWidth = Math.max(20, width - 2);
-		const contentWidth = Math.max(10, innerWidth - 2);
+		const contentWidth = Math.max(10, Math.min(innerWidth - 2, MAX_CONTENT_WIDTH));
 		const body: string[] = [];
 
-		const headline = [
-			`${facts.running ? "运行中" : "空闲"} ${formatMs(facts.elapsedMs)}`,
-			`turn ${facts.turns}`,
-			`ctx ${facts.contextText}`,
-			facts.pending ? "队列 1+" : "队列空",
-		];
+		const headline: string[] = [];
+		if (facts.phase === "never") {
+			headline.push("未记录", `ctx ${facts.contextText}`);
+		} else if (facts.phase === "running") {
+			headline.push(`运行中 ${formatMs(facts.elapsedMs)}`, `turn ${facts.turns}`, `ctx ${facts.contextText}`);
+			if (facts.pending) headline.push("队列 1+");
+		} else {
+			headline.push("空闲", `上次 ${formatMs(facts.elapsedMs)} 前`, `turn ${facts.turns}`, `ctx ${facts.contextText}`);
+			if (facts.pending) headline.push("队列 1+");
+		}
 		body.push(` ${th.fg("muted", headline.join(" · "))}`);
-		body.push("");
 
+		if (facts.runningTools.length > 0 || facts.recentTools.length > 0) body.push("");
 		if (facts.runningTools.length > 0) {
 			for (const tool of facts.runningTools) {
 				const elapsed = formatMs(Date.now() - tool.startedAt);
@@ -443,29 +458,30 @@ class ProgressPanel implements Component {
 			body.push(` ${mark} ${th.fg("muted", tool.name)} ${th.fg("dim", formatMs(tool.ms))}${brief}`);
 		}
 
-		body.push("");
+		if (facts.runningTools.length > 0 || facts.recentTools.length > 0) body.push("");
 		const elapsed = this.slice.status === "asking" ? formatMs(Date.now() - this.slice.startedAt) : undefined;
 		const scope = this.slice.contextNote ? ` · ${this.slice.contextNote}` : "";
+		const scrollNote = this.scrollOffset > 0 ? ` · ↑${this.scrollOffset}` : "";
 		const label =
 			this.slice.status === "asking"
 				? `摘要${scope} · 生成中 ${elapsed ?? ""}`
 				: this.slice.status === "done"
-					? `摘要${scope}`
+					? `摘要${scope}${scrollNote}`
 					: this.slice.status === "aborted"
-						? `摘要 · 已中止`
-						: `摘要 · 失败`;
+						? "摘要 · 已中止"
+						: "摘要 · 失败";
 		body.push(` ${th.fg("muted", truncateToWidth(label, contentWidth))}`);
 		if (this.slice.answer) {
-			const wrapped = wrapText(this.slice.answer, contentWidth, 10_000);
-			const maxOffset = Math.max(0, wrapped.length - ANSWER_VISIBLE_LINES);
-			this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
-			const start = Math.max(0, wrapped.length - ANSWER_VISIBLE_LINES - this.scrollOffset);
-			const visible = wrapped.slice(start, start + ANSWER_VISIBLE_LINES);
-			if (this.scrollOffset > 0) {
-				body.push(` ${th.fg("dim", `↑ 回看 ${this.scrollOffset} 行 · ↓ 回到底部`)}`);
+			if (this.markdownText !== this.slice.answer) {
+				this.markdownText = this.slice.answer;
+				this.markdown.setText(this.slice.answer);
 			}
-			for (const line of visible) {
-				body.push(` ${th.fg("text", line)}`);
+			const rendered = this.markdown.render(contentWidth);
+			const maxOffset = Math.max(0, rendered.length - ANSWER_VISIBLE_LINES);
+			this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
+			const start = Math.max(0, rendered.length - ANSWER_VISIBLE_LINES - this.scrollOffset);
+			for (const line of rendered.slice(start, start + ANSWER_VISIBLE_LINES)) {
+				body.push(` ${truncateToWidth(line, contentWidth, "…")}`);
 			}
 		} else if (this.slice.status === "asking") {
 			body.push(` ${th.fg("dim", "…")}`);
@@ -491,10 +507,7 @@ class ProgressPanel implements Component {
 			this.input.focused = wasFocused;
 		}
 		body.push(` ${inputLine}${" ".repeat(Math.max(0, contentWidth - visibleWidth(inputLine)))}`);
-		const hint =
-			this.slice.status === "asking"
-				? "生成中… Esc 中止 · ↑↓ 滚动"
-				: "Enter 追问（空着提交=重新问一次） · Esc 关闭 · ↑↓ 滚动";
+		const hint = this.slice.status === "asking" ? "Esc 中止" : "Enter 追问 · Esc 关闭 · ↑↓ 滚动";
 		body.push(` ${th.fg("dim", truncateToWidth(hint, contentWidth))}`);
 
 		return this.box(body, width, `/peek · ${truncateToWidth(this.slice.question, Math.max(8, innerWidth - 18))}`);
@@ -692,7 +705,7 @@ export default function progressExtension(pi: ExtensionAPI) {
 				},
 				{
 					overlay: true,
-					overlayOptions: { anchor: "top-center", width: "80%", maxHeight: "80%", margin: { top: 1 } },
+					overlayOptions: { anchor: "top-center", width: "76%", maxHeight: "70%", margin: { top: 1 } },
 				},
 			);
 			closed = true;
